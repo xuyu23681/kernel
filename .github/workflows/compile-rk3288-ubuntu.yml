@@ -1,0 +1,74 @@
+name: Compile RK3288 Ubuntu 25.04 with Linux 6.x
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y repo git gcc-arm-linux-gnueabihf u-boot-tools device-tree-compiler mtools parted libudev-dev libusb-1.0-0-dev python3-linaro-image-tools linaro-image-tools libssl-dev autotools-dev libsigsegv2 m4 libdrm-dev curl sed make binutils build-essential gcc g++ bash patch gzip bzip2 perl tar cpio python3 unzip rsync file bc wget libncurses5 libglib2.0-dev openssh-client lib32stdc++6 gcc-aarch64-linux-gnu libncurses5-dev lzop libssl1.0.0 libssl-dev libglade2-dev cvs mercurial subversion asciidoc w3m dblatex graphviz python3-matplotlib libc6:i386 texinfo liblz4-tool genext2fs expect autoconf intltool libqt4-dev libgtk2.0-dev debootstrap qemu-user-static binfmt-support
+
+      - name: Sync SDK code (if using repo)
+        run: |
+          repo init --no-clone-bundle --repo-url https://gitlab.com/firefly-linux/git-repo.git -u https://gitlab.com/firefly-linux/manifests.git -b master -m rk3288_linux_release.xml
+          repo sync -c --no-tags
+
+      - name: Download mainline kernel 6.6
+        run: |
+          wget https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz
+          tar -xJf linux-6.6.tar.xz
+          mv linux-6.6 kernel
+
+      - name: Compile U-Boot (keep official)
+        run: |
+          export RK_UBOOT_DEFCONFIG=firefly-rk3288
+          ./build.sh uboot
+
+      - name: Compile Kernel 6.6
+        run: |
+          cd kernel
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- multi_v7_defconfig
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j$(nproc) zImage modules
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- rk3288-firefly.dtb  # Use official DTS if needed, copy from SDK
+          cd ..
+          cp kernel/arch/arm/boot/zImage kernel/
+          cp kernel/arch/arm/boot/dts/rockchip/rk3288-firefly.dtb kernel/
+
+      - name: Build Ubuntu 25.04 armhf rootfs
+        run: |
+          sudo mkdir ubuntu_rootfs
+          sudo debootstrap --arch=armhf --foreign plucky ubuntu_rootfs http://ports.ubuntu.com/ubuntu-ports
+          sudo cp /usr/bin/qemu-arm-static ubuntu_rootfs/usr/bin/
+          sudo chroot ubuntu_rootfs /debootstrap/debootstrap --second-stage
+          # Configure basic settings (add users, etc.)
+          sudo chroot ubuntu_rootfs /bin/bash -c "echo 'root:password' | chpasswd"
+          sudo chroot ubuntu_rootfs /bin/bash -c "apt-get update && apt-get install -y sudo vim net-tools"  # Add packages as needed
+          # Pack rootfs into img
+          dd if=/dev/zero of=ubuntu_rootfs/rk3288_ubuntu_rootfs.img bs=1M count=6000  # Adjust size
+          mkfs.ext4 -d ubuntu_rootfs ubuntu_rootfs/rk3288_ubuntu_rootfs.img
+
+      - name: Pack firmware for eMMC
+        run: |
+          export RK_ARCH=arm
+          export RK_KERNEL_DEFCONFIG=firefly_linux_defconfig  # But using 6.x output
+          export RK_KERNEL_DTS=rk3288-firefly
+          export RK_PARAMETER=parameter-ubuntu.txt
+          export RK_ROOTFS_IMG=ubuntu_rootfs/rk3288_ubuntu_rootfs.img
+          ./build.sh firefly-rk3288-ubuntu.mk
+          ./mkfirmware.sh
+          ./build.sh updateimg  # Outputs rockdev/pack/update.img
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rk3288-ubuntu-25.04-linux6x.img
+          path: rockdev/pack/*.img
